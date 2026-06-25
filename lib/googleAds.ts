@@ -440,7 +440,7 @@ export async function pullAllAdsData(
       .map(([campaign, b]) => {
         const fin = finalizeBucket(b);
         const plId = plFromCampaign(campaign);
-        const meta = plId && plLookupMap[plId] ? plLookupMap[plId] : {};
+        const meta: { costMethod?: string; clientRate?: number | string } = plId && plLookupMap[plId] ? plLookupMap[plId] : {};
         return { campaign, ...fin, vr: placementVR[campaign] ?? fin.vrMetric, costMethod: meta.costMethod || '', clientRate: meta.clientRate ?? '' };
       }),
     creatives: Object.entries(creativeMap)
