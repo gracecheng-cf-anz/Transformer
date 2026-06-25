@@ -1,10 +1,66 @@
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
 import type { AdsData } from './googleAds';
+
+// ExcelJS 4.x throws "Cannot read properties of undefined (reading 'anchors')"
+// when a worksheet references a drawing (chart/image) that it cannot fully
+// reconcile. This app only reads/writes cell values, so we strip all drawing
+// references from the xlsx zip before handing it to ExcelJS.
+async function sanitizeXlsxBuffer(buffer: Buffer): Promise<Buffer> {
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(buffer);
+  } catch {
+    // Not a zip we can read; let ExcelJS handle/report it.
+    return buffer;
+  }
+
+  let modified = false;
+
+  // 1. Remove all drawing definition files (drawings, charts, embedded media refs).
+  Object.keys(zip.files).forEach(path => {
+    if (/^xl\/drawings\//i.test(path) || /^xl\/charts\//i.test(path)) {
+      zip.remove(path);
+      modified = true;
+    }
+  });
+
+  // 2. Strip <drawing .../> elements from each worksheet xml.
+  const sheetPaths = Object.keys(zip.files).filter(p => /^xl\/worksheets\/sheet[^/]+\.xml$/i.test(p));
+  for (const p of sheetPaths) {
+    const xml = await zip.file(p)!.async('string');
+    const cleaned = xml
+      .replace(/<drawing\b[^>]*\/>/gi, '')
+      .replace(/<drawing\b[^>]*>[\s\S]*?<\/drawing>/gi, '');
+    if (cleaned !== xml) {
+      zip.file(p, cleaned);
+      modified = true;
+    }
+  }
+
+  // 3. Remove drawing/chart relationships from worksheet rels.
+  const relPaths = Object.keys(zip.files).filter(p => /^xl\/worksheets\/_rels\/.+\.rels$/i.test(p));
+  for (const p of relPaths) {
+    const xml = await zip.file(p)!.async('string');
+    const cleaned = xml.replace(
+      /<Relationship\b[^>]*Type="[^"]*\/(?:drawing|chart)[^"]*"[^>]*\/>/gi,
+      ''
+    );
+    if (cleaned !== xml) {
+      zip.file(p, cleaned);
+      modified = true;
+    }
+  }
+
+  if (!modified) return buffer;
+  return zip.generateAsync({ type: 'nodebuffer' });
+}
 
 export async function loadWorkbook(buffer: Buffer): Promise<ExcelJS.Workbook> {
   const wb = new ExcelJS.Workbook();
+  const safe = await sanitizeXlsxBuffer(buffer);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await wb.xlsx.load(buffer as any);
+  await wb.xlsx.load(safe as any);
   return wb;
 }
 
