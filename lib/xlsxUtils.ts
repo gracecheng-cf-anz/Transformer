@@ -1,10 +1,109 @@
 import ExcelJS from 'exceljs';
+import JSZip from 'jszip';
+import { createRequire } from 'module';
 import type { AdsData } from './googleAds';
+
+// --- Bulletproof safety net -------------------------------------------------
+// ExcelJS 4.x crashes with "Cannot read properties of undefined (reading
+// 'anchors')" inside WorksheetXform.reconcile when a worksheet references a
+// drawing/chart that did not parse into options.drawings. We only care about
+// cell values, so we patch reconcile to drop the unresolved drawing and retry
+// instead of throwing. This runs once at module load.
+let reconcilePatched = false;
+function patchExcelJsReconcile() {
+  if (reconcilePatched) return;
+  reconcilePatched = true;
+  try {
+    // Prefer the ambient require (present in Next.js server bundles); fall back
+    // to createRequire when running as pure ESM.
+    const req: NodeRequire =
+      typeof require !== 'undefined'
+        ? require
+        : createRequire(typeof __filename !== 'undefined' ? __filename : process.cwd() + '/');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const WorksheetXform = req('exceljs/lib/xlsx/xform/sheet/worksheet-xform');
+    const proto = WorksheetXform?.prototype;
+    if (!proto || typeof proto.reconcile !== 'function' || proto.__v0Patched) return;
+    const original = proto.reconcile;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    proto.reconcile = function patchedReconcile(model: any, options: any) {
+      try {
+        return original.call(this, model, options);
+      } catch (err) {
+        if (model && model.drawing) {
+          // Drop the unresolvable drawing reference and retry once.
+          delete model.drawing;
+          return original.call(this, model, options);
+        }
+        throw err;
+      }
+    };
+    proto.__v0Patched = true;
+  } catch {
+    // If the internal path changes, fall back to zip sanitization only.
+  }
+}
+patchExcelJsReconcile();
+
+// ExcelJS 4.x throws "Cannot read properties of undefined (reading 'anchors')"
+// when a worksheet references a drawing (chart/image) that it cannot fully
+// reconcile. This app only reads/writes cell values, so we strip all drawing
+// references from the xlsx zip before handing it to ExcelJS.
+async function sanitizeXlsxBuffer(buffer: Buffer): Promise<Buffer> {
+  let zip: JSZip;
+  try {
+    zip = await JSZip.loadAsync(buffer);
+  } catch {
+    // Not a zip we can read; let ExcelJS handle/report it.
+    return buffer;
+  }
+
+  let modified = false;
+
+  // 1. Remove all drawing definition files (drawings, charts, embedded media refs).
+  Object.keys(zip.files).forEach(path => {
+    if (/^xl\/drawings\//i.test(path) || /^xl\/charts\//i.test(path)) {
+      zip.remove(path);
+      modified = true;
+    }
+  });
+
+  // 2. Strip <drawing .../> elements from each worksheet xml.
+  const sheetPaths = Object.keys(zip.files).filter(p => /^xl\/worksheets\/sheet[^/]+\.xml$/i.test(p));
+  for (const p of sheetPaths) {
+    const xml = await zip.file(p)!.async('string');
+    const cleaned = xml
+      .replace(/<drawing\b[^>]*\/>/gi, '')
+      .replace(/<drawing\b[^>]*>[\s\S]*?<\/drawing>/gi, '');
+    if (cleaned !== xml) {
+      zip.file(p, cleaned);
+      modified = true;
+    }
+  }
+
+  // 3. Remove drawing/chart relationships from worksheet rels.
+  const relPaths = Object.keys(zip.files).filter(p => /^xl\/worksheets\/_rels\/.+\.rels$/i.test(p));
+  for (const p of relPaths) {
+    const xml = await zip.file(p)!.async('string');
+    const cleaned = xml.replace(
+      /<Relationship\b[^>]*Type="[^"]*\/(?:drawing|chart)[^"]*"[^>]*\/>/gi,
+      ''
+    );
+    if (cleaned !== xml) {
+      zip.file(p, cleaned);
+      modified = true;
+    }
+  }
+
+  if (!modified) return buffer;
+  return zip.generateAsync({ type: 'nodebuffer' });
+}
 
 export async function loadWorkbook(buffer: Buffer): Promise<ExcelJS.Workbook> {
   const wb = new ExcelJS.Workbook();
+  const safe = await sanitizeXlsxBuffer(buffer);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await wb.xlsx.load(buffer as any);
+  await wb.xlsx.load(safe as any);
   return wb;
 }
 
