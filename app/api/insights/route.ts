@@ -72,7 +72,7 @@ export async function POST(req: NextRequest) {
 
     // Extract text from response
     let text = '';
-    const r = resp as Record<string, unknown>;
+    const r = resp as unknown as Record<string, unknown>;
     if (typeof r.output_text === 'string') text = r.output_text;
     else if (Array.isArray(r.output)) {
       const parts: string[] = [];
